@@ -787,8 +787,7 @@ class ChatGLM6BModel(ChatGLM6BPreTrainedModel):
 
         return attention_mask
 
-    @staticmethod
-    def get_position_ids(seq, mask_position, device, gmask=False):
+    def get_position_ids(self, seq, mask_position, device, gmask=False):
         context_length = seq.index(150004) + 1
         if self.position_encoding_2d:
             seq_length = seq.index(150004)
@@ -1122,7 +1121,7 @@ class ChatGLM6BForConditionalGeneration(ChatGLM6BPreTrainedModel):
             new_query = query
             for i, (query, response) in enumerate(history):
                 prompt += "## 第 {} 轮##\n问：{}\n答：{}\n".format(i, query, response)
-            prompt += "## 第 {} 轮##\n问：{}\n答：[gMASK]".format(len(history), new_query)
+            prompt += "## 第 {} 轮##\n问：{}\n答：".format(len(history), new_query)
             input_ids = tokenizer([prompt], return_tensors="pt", padding=True)
             input_ids = input_ids.to('cuda')
             outputs = self.generate(**input_ids, max_length=max_length, num_beams=2)

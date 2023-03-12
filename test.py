@@ -5,7 +5,7 @@ from transformers import ChatGLM6BTokenizer, ChatGLM6BModel, ChatGLM6BForConditi
 
 print("loading")
 
-tokenizer = AutoTokenizer.from_pretrained("/raid/sxx/GLM6B/hfg_ckpt/")
+tokenizer = AutoTokenizer.from_pretrained("THUDM/chatglm-6b", trust_remote_code=True)  # /raid/sxx/GLM6B/chatglm-6b/
 # tokenizer.save_pretrained("/raid/sxx/GLM6B/hfg_ckpt/")
 # tokenizer.push_to_hub("THUDM/ChatGLM-6B", private=True, use_auth_token="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")
 
@@ -14,8 +14,8 @@ tokenizer = AutoTokenizer.from_pretrained("/raid/sxx/GLM6B/hfg_ckpt/")
 # model.load_state_dict(state_dict)
 # model.save_pretrained("/mnt/vepfs/workspace/sxx/checkpoints/qa-glm-6b-sft-v0.7.5/hfg_ckpt/")
 
-model = AutoModelForSeq2SeqLM.from_pretrained("/raid/sxx/GLM6B/hfg_ckpt/")
-model.save_pretrained("/raid/sxx/GLM6B/hfg_ckpt/")
+model = AutoModelForSeq2SeqLM.from_pretrained("THUDM/chatglm-6b", trust_remote_code=True)  # THUDM/chatglm-6b
+# model.save_pretrained("/raid/sxx/GLM6B/hfg_ckpt/")
 model = model.half().cuda()
 model.eval()
 
@@ -23,7 +23,7 @@ model.eval()
 # # Inference
 print("inference")
 
-input_ids = tokenizer(["清华大学[gMASK]"], return_tensors="pt", padding=True)
+input_ids = tokenizer(["清华大学"], return_tensors="pt", padding=True)
 print(input_ids)
 input_ids = input_ids.to('cuda')
 
