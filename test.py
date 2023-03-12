@@ -24,6 +24,7 @@ model.eval()
 print("inference")
 
 input_ids = tokenizer(["清华大学[gMASK]"], return_tensors="pt", padding=True)
+print(input_ids)
 input_ids = input_ids.to('cuda')
 
 outputs = model.generate(**input_ids, max_length=512, num_beams=2)
