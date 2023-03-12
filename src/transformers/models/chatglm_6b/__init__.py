@@ -14,24 +14,23 @@
 from typing import TYPE_CHECKING
 
 from ...utils import  _LazyModule, OptionalDependencyNotAvailable, is_tokenizers_available
-from ...utils import is_torch_available
+from ...utils import is_torch_available, is_sentencepiece_available
 
 
 
 
 _import_structure = {
-    "configuration_chatglm_6b": ["CHATGLM_6B_PRETRAINED_CONFIG_ARCHIVE_MAP", "ChatGLM6BConfig"],
-    "tokenization_chatglm_6b": ["ChatGLM6BTokenizer"],
+    "configuration_chatglm_6b": ["CHATGLM_6B_PRETRAINED_CONFIG_ARCHIVE_MAP", "ChatGLM6BConfig"]
 }
 
 try:
-    if not is_tokenizers_available():
+    if not is_sentencepiece_available():
         raise OptionalDependencyNotAvailable()
 except OptionalDependencyNotAvailable:
     pass
 else:
-    _import_structure["tokenization_chatglm_6b_fast"] = ["ChatGLM6BTokenizerFast"]
-
+    _import_structure["tokenization_chatglm_6b"] = ["ChatGLM6BTokenizer"]
+    
 try:
     if not is_torch_available():
         raise OptionalDependencyNotAvailable()
@@ -40,15 +39,9 @@ except OptionalDependencyNotAvailable:
 else:
     _import_structure["modeling_chatglm_6b"] = [
         "CHATGLM_6B_PRETRAINED_MODEL_ARCHIVE_LIST",
-        "ChatGLM6BForMaskedLM",
-        "ChatGLM6BForCausalLM",
-        "ChatGLM6BForMultipleChoice",
-        "ChatGLM6BForQuestionAnswering",
-        "ChatGLM6BForSequenceClassification",
-        "ChatGLM6BForTokenClassification",
-        "ChatGLM6BLayer",
         "ChatGLM6BModel",
         "ChatGLM6BPreTrainedModel",
+        "ChatGLM6BForConditionalGeneration",
         "load_tf_weights_in_chatglm_6b",
     ]
 
@@ -57,15 +50,14 @@ else:
 
 if TYPE_CHECKING:
     from .configuration_chatglm_6b import CHATGLM_6B_PRETRAINED_CONFIG_ARCHIVE_MAP, ChatGLM6BConfig
-    from .tokenization_chatglm_6b import ChatGLM6BTokenizer
 
     try:
-        if not is_tokenizers_available():
+        if not is_sentencepiece_available():
             raise OptionalDependencyNotAvailable()
     except OptionalDependencyNotAvailable:
         pass
     else:
-        from .tokenization_chatglm_6b_fast import ChatGLM6BTokenizerFast
+        from .tokenization_chatglm_6b import ChatGLM6BTokenizer
 
     try:
         if not is_torch_available():
@@ -75,15 +67,9 @@ if TYPE_CHECKING:
     else:
         from .modeling_chatglm_6b import (
             CHATGLM_6B_PRETRAINED_MODEL_ARCHIVE_LIST,
-            ChatGLM6BForMaskedLM,
-            ChatGLM6BForCausalLM,
-            ChatGLM6BForMultipleChoice,
-            ChatGLM6BForQuestionAnswering,
-            ChatGLM6BForSequenceClassification,
-            ChatGLM6BForTokenClassification,
-            ChatGLM6BLayer,
             ChatGLM6BModel,
             ChatGLM6BPreTrainedModel,
+            ChatGLM6BForConditionalGeneration,
             load_tf_weights_in_chatglm_6b,
         )
 

@@ -149,507 +149,481 @@ def load_tf_weights_in_chatglm_6b(model, config, tf_checkpoint_path):
     return model
 
 
-class ChatGLM6BEmbeddings(nn.Module):
-    """Construct the embeddings from word, position and token_type embeddings."""
+@torch.jit.script
+def gelu_impl(x):
+     """OpenAI's gelu implementation."""
+     return 0.5 * x * (1.0 + torch.tanh(0.7978845608028654 * x *
+                                        (1.0 + 0.044715 * x * x)))
 
-    def __init__(self, config):
+
+def gelu(x): 
+    return gelu_impl(x)
+
+
+class RotaryEmbedding(torch.nn.Module):
+    def __init__(self, dim, base=10000, precision=torch.half, learnable=False):
         super().__init__()
-        self.word_embeddings = nn.Embedding(config.vocab_size, config.hidden_size, padding_idx=config.pad_token_id)
-        self.position_embeddings = nn.Embedding(config.max_position_embeddings, config.hidden_size)
-        self.token_type_embeddings = nn.Embedding(config.type_vocab_size, config.hidden_size)
+        inv_freq = 1. / (base ** (torch.arange(0, dim, 2).float() / dim))
+        inv_freq = inv_freq.half()
+        self.learnable = learnable
+        if learnable:
+            self.inv_freq = torch.nn.Parameter(inv_freq)
+            self.max_seq_len_cached = None
+        else:
+            self.register_buffer('inv_freq', inv_freq)
+            self.max_seq_len_cached = None
+            self.cos_cached = None
+            self.sin_cached = None
+        self.precision = precision
 
-        # self.LayerNorm is not snake-cased to stick with TensorFlow model variable name and be able to load
-        # any TensorFlow checkpoint file
-        self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
-        self.dropout = nn.Dropout(config.hidden_dropout_prob)
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
+        pass
 
-        # position_ids (1, len position emb) is contiguous in memory and exported when serialized
-        self.register_buffer("position_ids", torch.arange(config.max_position_embeddings).expand((1, -1)))
-        self.position_embedding_type = getattr(config, "position_embedding_type", "absolute")
-        self.register_buffer(
-            "token_type_ids",
-            torch.zeros(self.position_ids.size(), dtype=torch.long, device=self.position_ids.device),
-            persistent=False,
+
+    def forward(self, x, seq_dim=1, seq_len=None):
+        if seq_len is None:
+            seq_len = x.shape[seq_dim]
+        if self.max_seq_len_cached is None or (seq_len > self.max_seq_len_cached):
+            self.max_seq_len_cached = None if self.learnable else seq_len
+            t = torch.arange(seq_len, device=x.device, dtype=self.inv_freq.dtype)
+            freqs = torch.einsum('i,j->ij', t, self.inv_freq)
+            # Different from paper, but it uses a different permutation in order to obtain the same calculation
+            emb = torch.cat((freqs, freqs), dim=-1).to(x.device)
+            if self.precision == torch.bfloat16:
+                emb = emb.float()
+
+            # [sx, 1 (b * np), hn]
+            cos_cached = emb.cos()[:, None, :]
+            sin_cached = emb.sin()[:, None, :]
+            if self.precision == torch.bfloat16:
+                cos_cached = cos_cached.bfloat16()
+                sin_cached = sin_cached.bfloat16()
+            if self.learnable:
+                return cos_cached, sin_cached
+            self.cos_cached, self.sin_cached = cos_cached, sin_cached
+        return self.cos_cached[:seq_len, ...], self.sin_cached[:seq_len, ...]
+
+def rotate_half(x):
+    x1, x2 = x[..., :x.shape[-1] // 2], x[..., x.shape[-1] // 2:]
+    return torch.cat((-x2, x1), dim=x1.ndim - 1)  # dim=-1 triggers a bug in earlier torch versions
+
+
+@torch.jit.script
+def apply_rotary_pos_emb_index(q, k, cos, sin, position_id):
+    # position_id: [sq, b], q, k: [sq, b, np, hn], cos: [sq, 1, hn] -> [sq, b, 1, hn]
+    cos, sin = F.embedding(position_id, cos.squeeze(1)).unsqueeze(2), \
+               F.embedding(position_id, sin.squeeze(1)).unsqueeze(2)
+    q, k = (q * cos) + (rotate_half(q) * sin), (k * cos) + (rotate_half(k) * sin)
+    return q, k
+
+
+def attention_fn(
+        self,
+        query_layer,
+        key_layer,
+        value_layer,
+        attention_mask,
+        hidden_size_per_partition,
+        layer_id,
+        layer_past=None,
+        scaling_attention_score=True,
+        use_cache=False,
+    ):
+        if layer_past is not None:
+            past_key, past_value = layer_past
+            key_layer = torch.cat((past_key, key_layer), dim=0)
+            value_layer = torch.cat((past_value, value_layer), dim=0)
+        
+        # seqlen, batch, num_attention_heads, hidden_size_per_attention_head
+        seq_len, b, nh, hidden_size = key_layer.shape
+
+
+        if use_cache:
+            present = (key_layer, value_layer)
+        else:
+            present = None
+
+        query_key_layer_scaling_coeff = float(layer_id + 1)
+        if scaling_attention_score:
+            query_layer = query_layer / (math.sqrt(hidden_size) * query_key_layer_scaling_coeff)
+
+        # ===================================
+        # Raw attention scores. [b, np, s, s]
+        # ===================================
+
+        # [b, np, sq, sk]
+        output_size = (query_layer.size(1), query_layer.size(2), query_layer.size(0), key_layer.size(0))
+
+        # [sq, b, np, hn] -> [sq, b * np, hn]
+        query_layer = query_layer.view(output_size[2], output_size[0] * output_size[1], -1)
+        # [sk, b, np, hn] -> [sk, b * np, hn]
+        key_layer = key_layer.view(output_size[3], output_size[0] * output_size[1], -1)
+
+        matmul_result = torch.empty(
+            output_size[0] * output_size[1],
+            output_size[2],
+            output_size[3],
+            dtype=query_layer.dtype,
+            device=query_layer.device,
         )
 
-    def forward(
-        self, input_ids=None, token_type_ids=None, position_ids=None, inputs_embeds=None, past_key_values_length=0
-    ):
-        if input_ids is not None:
-            input_shape = input_ids.size()
+        matmul_result = torch.baddbmm(
+            matmul_result,
+            query_layer.transpose(0, 1),  # [b * np, sq, hn]
+            key_layer.transpose(0, 1).transpose(1, 2),  # [b * np, hn, sk]
+            beta=0.0,
+            alpha=1.0,
+        )
+
+        # change view to [b, np, sq, sk]
+        attention_scores = matmul_result.view(*output_size)
+
+        if self.scale_mask_softmax:
+            self.scale_mask_softmax.scale = query_key_layer_scaling_coeff
+            attention_probs = self.scale_mask_softmax(attention_scores, attention_mask.contiguous())
         else:
-            input_shape = inputs_embeds.size()[:-1]
+            if not (attention_mask == 0).all():
+                # if auto-regressive, skip
+                attention_scores.masked_fill_(attention_mask, -10000.0)
 
-        seq_length = input_shape[1]
+            attention_scores = attention_scores.float()
+            attention_scores = attention_scores * query_key_layer_scaling_coeff
 
-        if position_ids is None:
-            position_ids = self.position_ids[:, past_key_values_length : seq_length + past_key_values_length]
+            attention_probs = F.softmax(attention_scores, dim=-1)
 
-        # Setting the token_type_ids to the registered buffer in constructor where it is all zeros, which usually occurs
-        # when its auto-generated, registered buffer helps users when tracing the model without passing token_type_ids, solves
-        # issue #5664
-        if token_type_ids is None:
-            if hasattr(self, "token_type_ids"):
-                buffered_token_type_ids = self.token_type_ids[:, :seq_length]
-                buffered_token_type_ids_expanded = buffered_token_type_ids.expand(input_shape[0], seq_length)
-                token_type_ids = buffered_token_type_ids_expanded
-            else:
-                token_type_ids = torch.zeros(input_shape, dtype=torch.long, device=self.position_ids.device)
-
-        if inputs_embeds is None:
-            inputs_embeds = self.word_embeddings(input_ids)
-        token_type_embeddings = self.token_type_embeddings(token_type_ids)
-
-        embeddings = inputs_embeds + token_type_embeddings
-        if self.position_embedding_type == "absolute":
-            position_embeddings = self.position_embeddings(position_ids)
-            embeddings += position_embeddings
-        embeddings = self.LayerNorm(embeddings)
-        embeddings = self.dropout(embeddings)
-        return embeddings
+            attention_probs = attention_probs.half()
 
 
-class ChatGLM6BSelfAttention(nn.Module):
-    def __init__(self, config, position_embedding_type=None):
-        super().__init__()
-        if config.hidden_size % config.num_attention_heads != 0 and not hasattr(config, "embedding_size"):
-            raise ValueError(
-                f"The hidden size ({config.hidden_size}) is not a multiple of the number of attention "
-                f"heads ({config.num_attention_heads})"
-            )
+        # =========================
+        # Context layer. [sq, b, hp]
+        # =========================
 
-        self.num_attention_heads = config.num_attention_heads
-        self.attention_head_size = int(config.hidden_size / config.num_attention_heads)
-        self.all_head_size = self.num_attention_heads * self.attention_head_size
+        # value_layer -> context layer.
+        # [sk, b, np, hn] --> [b, np, sq, hn]
 
-        self.query = nn.Linear(config.hidden_size, self.all_head_size)
-        self.key = nn.Linear(config.hidden_size, self.all_head_size)
-        self.value = nn.Linear(config.hidden_size, self.all_head_size)
+        # context layer shape: [b, np, sq, hn]
+        output_size = (value_layer.size(1), value_layer.size(2), query_layer.size(0), value_layer.size(3))
 
-        self.dropout = nn.Dropout(config.attention_probs_dropout_prob)
-        self.position_embedding_type = position_embedding_type or getattr(config, "position_embedding_type", "absolute")
-        if self.position_embedding_type == "relative_key" or self.position_embedding_type == "relative_key_query":
-            self.max_position_embeddings = config.max_position_embeddings
-            self.distance_embedding = nn.Embedding(2 * config.max_position_embeddings - 1, self.attention_head_size)
+        # change view [sk, b * np, hn]
+        value_layer = value_layer.view(value_layer.size(0), output_size[0] * output_size[1], -1)
 
-        self.is_decoder = config.is_decoder
+        # change view [b * np, sq, sk]
+        attention_probs = attention_probs.view(output_size[0] * output_size[1], output_size[2], -1)
 
-    def transpose_for_scores(self, x):
-        new_x_shape = x.size()[:-1] + (self.num_attention_heads, self.attention_head_size)
-        x = x.view(*new_x_shape)
-        return x.permute(0, 2, 1, 3)
+        # matmul: [b * np, sq, hn]
+        context_layer = torch.bmm(attention_probs, value_layer.transpose(0, 1))
 
-    def forward(
-        self,
-        hidden_states,
-        attention_mask=None,
-        head_mask=None,
-        encoder_hidden_states=None,
-        encoder_attention_mask=None,
-        past_key_value=None,
-        output_attentions=False,
-    ):
-        mixed_query_layer = self.query(hidden_states)
+        # change view [b, np, sq, hn]
+        context_layer = context_layer.view(*output_size)
 
-        # If this is instantiated as a cross-attention module, the keys
-        # and values come from an encoder; the attention mask needs to be
-        # such that the encoder's padding tokens are not attended to.
-        is_cross_attention = encoder_hidden_states is not None
+        # [b, np, sq, hn] --> [sq, b, np, hn]
+        context_layer = context_layer.permute(2, 0, 1, 3).contiguous()
 
-        if is_cross_attention and past_key_value is not None:
-            # reuse k,v, cross_attentions
-            key_layer = past_key_value[0]
-            value_layer = past_key_value[1]
-            attention_mask = encoder_attention_mask
-        elif is_cross_attention:
-            key_layer = self.transpose_for_scores(self.key(encoder_hidden_states))
-            value_layer = self.transpose_for_scores(self.value(encoder_hidden_states))
-            attention_mask = encoder_attention_mask
-        elif past_key_value is not None:
-            key_layer = self.transpose_for_scores(self.key(hidden_states))
-            value_layer = self.transpose_for_scores(self.value(hidden_states))
-            key_layer = torch.cat([past_key_value[0], key_layer], dim=2)
-            value_layer = torch.cat([past_key_value[1], value_layer], dim=2)
-        else:
-            key_layer = self.transpose_for_scores(self.key(hidden_states))
-            value_layer = self.transpose_for_scores(self.value(hidden_states))
-
-        query_layer = self.transpose_for_scores(mixed_query_layer)
-
-        if self.is_decoder:
-            # if cross_attention save Tuple(torch.Tensor, torch.Tensor) of all cross attention key/value_states.
-            # Further calls to cross_attention layer can then reuse all cross-attention
-            # key/value_states (first "if" case)
-            # if uni-directional self-attention (decoder) save Tuple(torch.Tensor, torch.Tensor) of
-            # all previous decoder key/value_states. Further calls to uni-directional self-attention
-            # can concat previous decoder key/value_states to current projected key/value_states (third "elif" case)
-            # if encoder bi-directional self-attention `past_key_value` is always `None`
-            past_key_value = (key_layer, value_layer)
-
-        # Take the dot product between "query" and "key" to get the raw attention scores.
-        attention_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2))
-
-        if self.position_embedding_type == "relative_key" or self.position_embedding_type == "relative_key_query":
-            seq_length = hidden_states.size()[1]
-            position_ids_l = torch.arange(seq_length, dtype=torch.long, device=hidden_states.device).view(-1, 1)
-            position_ids_r = torch.arange(seq_length, dtype=torch.long, device=hidden_states.device).view(1, -1)
-            distance = position_ids_l - position_ids_r
-            positional_embedding = self.distance_embedding(distance + self.max_position_embeddings - 1)
-            positional_embedding = positional_embedding.to(dtype=query_layer.dtype)  # fp16 compatibility
-
-            if self.position_embedding_type == "relative_key":
-                relative_position_scores = torch.einsum("bhld,lrd->bhlr", query_layer, positional_embedding)
-                attention_scores = attention_scores + relative_position_scores
-            elif self.position_embedding_type == "relative_key_query":
-                relative_position_scores_query = torch.einsum("bhld,lrd->bhlr", query_layer, positional_embedding)
-                relative_position_scores_key = torch.einsum("bhrd,lrd->bhlr", key_layer, positional_embedding)
-                attention_scores = attention_scores + relative_position_scores_query + relative_position_scores_key
-
-        attention_scores = attention_scores / math.sqrt(self.attention_head_size)
-        if attention_mask is not None:
-            # Apply the attention mask is (precomputed for all layers in ChatGLM6BModel forward() function)
-            attention_scores = attention_scores + attention_mask
-
-        # Normalize the attention scores to probabilities.
-        attention_probs = nn.functional.softmax(attention_scores, dim=-1)
-
-        # This is actually dropping out entire tokens to attend to, which might
-        # seem a bit unusual, but is taken from the original Transformer paper.
-        attention_probs = self.dropout(attention_probs)
-
-        # Mask heads if we want to
-        if head_mask is not None:
-            attention_probs = attention_probs * head_mask
-
-        context_layer = torch.matmul(attention_probs, value_layer)
-
-        context_layer = context_layer.permute(0, 2, 1, 3).contiguous()
-        new_context_layer_shape = context_layer.size()[:-2] + (self.all_head_size,)
+        # [sq, b, np, hn] --> [sq, b, hp]
+        new_context_layer_shape = context_layer.size()[:-2] + (hidden_size_per_partition,)
         context_layer = context_layer.view(*new_context_layer_shape)
 
-        outputs = (context_layer, attention_probs) if output_attentions else (context_layer,)
-
-        if self.is_decoder:
-            outputs = outputs + (past_key_value,)
-        return outputs
-
-
-class ChatGLM6BSelfOutput(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.dense = nn.Linear(config.hidden_size, config.hidden_size)
-        self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
-        self.dropout = nn.Dropout(config.hidden_dropout_prob)
-
-    def forward(self, hidden_states, input_tensor):
-        hidden_states = self.dense(hidden_states)
-        hidden_states = self.dropout(hidden_states)
-        hidden_states = self.LayerNorm(hidden_states + input_tensor)
-        return hidden_states
-
-
-class ChatGLM6BAttention(nn.Module):
-    def __init__(self, config, position_embedding_type=None):
-        super().__init__()
-        self.self = ChatGLM6BSelfAttention(config, position_embedding_type=position_embedding_type)
-        self.output = ChatGLM6BSelfOutput(config)
-        self.pruned_heads = set()
-
-    def prune_heads(self, heads):
-        if len(heads) == 0:
-            return
-        heads, index = find_pruneable_heads_and_indices(
-            heads, self.self.num_attention_heads, self.self.attention_head_size, self.pruned_heads
-        )
-
-        # Prune linear layers
-        self.self.query = prune_linear_layer(self.self.query, index)
-        self.self.key = prune_linear_layer(self.self.key, index)
-        self.self.value = prune_linear_layer(self.self.value, index)
-        self.output.dense = prune_linear_layer(self.output.dense, index, dim=1)
-
-        # Update hyper params and store pruned heads
-        self.self.num_attention_heads = self.self.num_attention_heads - len(heads)
-        self.self.all_head_size = self.self.attention_head_size * self.self.num_attention_heads
-        self.pruned_heads = self.pruned_heads.union(heads)
-
-    def forward(
-        self,
-        hidden_states,
-        attention_mask=None,
-        head_mask=None,
-        encoder_hidden_states=None,
-        encoder_attention_mask=None,
-        past_key_value=None,
-        output_attentions=False,
-    ):
-        self_outputs = self.self(
-            hidden_states,
-            attention_mask,
-            head_mask,
-            encoder_hidden_states,
-            encoder_attention_mask,
-            past_key_value,
-            output_attentions,
-        )
-        attention_output = self.output(self_outputs[0], hidden_states)
-        outputs = (attention_output,) + self_outputs[1:]  # add attentions if we output them
-        return outputs
-
-
-class ChatGLM6BIntermediate(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.dense = nn.Linear(config.hidden_size, config.intermediate_size)
-        if isinstance(config.hidden_act, str):
-            self.intermediate_act_fn = ACT2FN[config.hidden_act]
-        else:
-            self.intermediate_act_fn = config.hidden_act
-
-    def forward(self, hidden_states):
-        hidden_states = self.dense(hidden_states)
-        hidden_states = self.intermediate_act_fn(hidden_states)
-        return hidden_states
-
-
-class ChatGLM6BOutput(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.dense = nn.Linear(config.intermediate_size, config.hidden_size)
-        self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
-        self.dropout = nn.Dropout(config.hidden_dropout_prob)
-
-    def forward(self, hidden_states, input_tensor):
-        hidden_states = self.dense(hidden_states)
-        hidden_states = self.dropout(hidden_states)
-        hidden_states = self.LayerNorm(hidden_states + input_tensor)
-        return hidden_states
-
-
-class ChatGLM6BLayer(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.chunk_size_feed_forward = config.chunk_size_feed_forward
-        self.seq_len_dim = 1
-        self.attention = ChatGLM6BAttention(config)
-        self.is_decoder = config.is_decoder
-        self.add_cross_attention = config.add_cross_attention
-        if self.add_cross_attention:
-            assert self.is_decoder, f"{self} should be used as a decoder model if cross attention is added"
-            self.crossattention = ChatGLM6BAttention(config, position_embedding_type="absolute")
-        self.intermediate = ChatGLM6BIntermediate(config)
-        self.output = ChatGLM6BOutput(config)
-
-    def forward(
-        self,
-        hidden_states,
-        attention_mask=None,
-        head_mask=None,
-        encoder_hidden_states=None,
-        encoder_attention_mask=None,
-        past_key_value=None,
-        output_attentions=False,
-    ):
-        # decoder uni-directional self-attention cached key/values tuple is at positions 1,2
-        self_attn_past_key_value = past_key_value[:2] if past_key_value is not None else None
-        self_attention_outputs = self.attention(
-            hidden_states,
-            attention_mask,
-            head_mask,
-            output_attentions=output_attentions,
-            past_key_value=self_attn_past_key_value,
-        )
-        attention_output = self_attention_outputs[0]
-
-        # if decoder, the last output is tuple of self-attn cache
-        if self.is_decoder:
-            outputs = self_attention_outputs[1:-1]
-            present_key_value = self_attention_outputs[-1]
-        else:
-            outputs = self_attention_outputs[1:]  # add self attentions if we output attention weights
-
-        cross_attn_present_key_value = None
-        if self.is_decoder and encoder_hidden_states is not None:
-            assert hasattr(
-                self, "crossattention"
-            ), f"If `encoder_hidden_states` are passed, {self} has to be instantiated with cross-attention layers by setting `config.add_cross_attention=True`"
-
-            # cross_attn cached key/values tuple is at positions 3,4 of past_key_value tuple
-            cross_attn_past_key_value = past_key_value[-2:] if past_key_value is not None else None
-            cross_attention_outputs = self.crossattention(
-                attention_output,
-                attention_mask,
-                head_mask,
-                encoder_hidden_states,
-                encoder_attention_mask,
-                cross_attn_past_key_value,
-                output_attentions,
-            )
-            attention_output = cross_attention_outputs[0]
-            outputs = outputs + cross_attention_outputs[1:-1]  # add cross attentions if we output attention weights
-
-            # add cross-attn cache to positions 3,4 of present_key_value tuple
-            cross_attn_present_key_value = cross_attention_outputs[-1]
-            present_key_value = present_key_value + cross_attn_present_key_value
-
-        layer_output = apply_chunking_to_forward(
-            self.feed_forward_chunk, self.chunk_size_feed_forward, self.seq_len_dim, attention_output
-        )
-        outputs = (layer_output,) + outputs
-
-        # if decoder, return the attn key/values as the last output
-        if self.is_decoder:
-            outputs = outputs + (present_key_value,)
+        outputs = (context_layer, present, attention_probs)
 
         return outputs
 
-    def feed_forward_chunk(self, attention_output):
-        intermediate_output = self.intermediate(attention_output)
-        layer_output = self.output(intermediate_output, attention_output)
-        return layer_output
 
-
-class ChatGLM6BEncoder(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.config = config
-        self.layer = nn.ModuleList([ChatGLM6BLayer(config) for _ in range(config.num_hidden_layers)])
-        self.gradient_checkpointing = False
-
-    def forward(
-        self,
-        hidden_states,
-        attention_mask=None,
-        head_mask=None,
-        encoder_hidden_states=None,
-        encoder_attention_mask=None,
-        past_key_values=None,
-        use_cache=None,
-        output_attentions=False,
-        output_hidden_states=False,
-        return_dict=True,
-    ):
-        if self.gradient_checkpointing and self.training and use_cache:
-            logger.warning(
-                "`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`..."
-            )
-            use_cache = False
-
-        all_hidden_states = () if output_hidden_states else None
-        all_self_attentions = () if output_attentions else None
-        all_cross_attentions = () if output_attentions and self.config.add_cross_attention else None
-        next_decoder_cache = () if use_cache else None
-
-        for i, layer_module in enumerate(self.layer):
-            if output_hidden_states:
-                all_hidden_states = all_hidden_states + (hidden_states,)
-
-            layer_head_mask = head_mask[i] if head_mask is not None else None
-            past_key_value = past_key_values[i] if past_key_values is not None else None
-
-            if self.gradient_checkpointing and self.training:
-                def create_custom_forward(module):
-                    def custom_forward(*inputs):
-                        return module(*inputs, past_key_value, output_attentions)
-
-                    return custom_forward
-
-                layer_outputs = torch.utils.checkpoint.checkpoint(
-                    create_custom_forward(layer_module),
-                    hidden_states,
-                    attention_mask,
-                    layer_head_mask,
-                    encoder_hidden_states,
-                    encoder_attention_mask,
-                )
-            else:
-                layer_outputs = layer_module(
-                    hidden_states,
-                    attention_mask,
-                    layer_head_mask,
-                    encoder_hidden_states,
-                    encoder_attention_mask,
-                    past_key_value,
-                    output_attentions,
-                )
-
-            hidden_states = layer_outputs[0]
-            if use_cache:
-                next_decoder_cache += (layer_outputs[-1],)
-            if output_attentions:
-                all_self_attentions = all_self_attentions + (layer_outputs[1],)
-                if self.config.add_cross_attention:
-                    all_cross_attentions = all_cross_attentions + (layer_outputs[2],)
-
-        if output_hidden_states:
-            all_hidden_states = all_hidden_states + (hidden_states,)
-
-        if not return_dict:
-            return tuple(
-                v
-                for v in [
-                    hidden_states,
-                    next_decoder_cache,
-                    all_hidden_states,
-                    all_self_attentions,
-                    all_cross_attentions,
-                ]
-                if v is not None
-            )
-        return BaseModelOutputWithPastAndCrossAttentions(
-            last_hidden_state=hidden_states,
-            past_key_values=next_decoder_cache,
-            hidden_states=all_hidden_states,
-            attentions=all_self_attentions,
-            cross_attentions=all_cross_attentions,
+class SelfAttention(torch.nn.Module):
+    def __init__(self, hidden_size, num_attention_heads,
+                 layer_id, hidden_size_per_attention_head=None, bias=True,
+                 params_dtype=torch.float, position_encoding_2d=True):
+        super(SelfAttention, self).__init__()
+        
+        self.layer_id = layer_id
+        self.hidden_size = hidden_size
+        self.hidden_size_per_partition = hidden_size
+        self.num_attention_heads = num_attention_heads
+        self.num_attention_heads_per_partition = num_attention_heads
+        self.position_encoding_2d = position_encoding_2d
+        self.rotary_emb = RotaryEmbedding(
+            self.hidden_size // (self.num_attention_heads * 2)
+            if position_encoding_2d
+            else self.hidden_size // self.num_attention_heads,
+            base=10000,
+            precision=torch.half,
+            learnable=False,
         )
 
+        self.scale_mask_softmax = None
 
-class ChatGLM6BPredictionHeadTransform(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.dense = nn.Linear(config.hidden_size, config.hidden_size)
-        if isinstance(config.hidden_act, str):
-            self.transform_act_fn = ACT2FN[config.hidden_act]
+        if hidden_size_per_attention_head is None:
+            self.hidden_size_per_attention_head = hidden_size // num_attention_heads
         else:
-            self.transform_act_fn = config.hidden_act
-        self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+            self.hidden_size_per_attention_head = hidden_size_per_attention_head
+
+        self.inner_hidden_size = num_attention_heads * self.hidden_size_per_attention_head
+
+        # Strided linear layer.
+        self.query_key_value = skip_init(
+            torch.nn.Linear,
+            hidden_size,
+            3 * self.inner_hidden_size,
+            bias=bias,
+            dtype=params_dtype,
+        )
+
+        self.dense = skip_init(
+            torch.nn.Linear,
+            self.inner_hidden_size,
+            hidden_size,
+            bias=bias,
+            dtype=params_dtype,
+        )
+    
+    @staticmethod
+    def attention_mask_func(attention_scores, attention_mask):
+        attention_scores.masked_fill_(attention_mask, -10000.0)
+        return attention_scores
+
+    def split_tensor_along_last_dim(self, tensor, num_partitions,
+                                contiguous_split_chunks=False):
+        """Split a tensor along its last dimension.
+        Arguments:
+            tensor: input tensor.
+            num_partitions: number of partitions to split the tensor
+            contiguous_split_chunks: If True, make each chunk contiguous
+                                    in memory.
+        """
+        # Get the size and dimension.
+        last_dim = tensor.dim() - 1
+        last_dim_size = tensor.size()[last_dim] // num_partitions
+        # Split.
+        tensor_list = torch.split(tensor, last_dim_size, dim=last_dim)
+        # Note: torch.split does not create contiguous tensors by default.
+        if contiguous_split_chunks:
+            return tuple(chunk.contiguous() for chunk in tensor_list)
+
+        return tensor_list
+
+    def forward(
+        self, 
+        hidden_states: torch.Tensor,
+        position_ids,
+        attention_mask: torch.Tensor, 
+        layer_id,
+        layer_past: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        use_cache: bool = False,
+        output_attentions: bool = False,
+    ):
+        """
+        hidden_states: [seq_len, batch, hidden_size]
+        attention_mask: [(1, 1), seq_len, seq_len]
+        """
+        
+        # [seq_len, batch, 3 * hidden_size]
+        mixed_raw_layer = self.query_key_value(hidden_states)
+
+        # [seq_len, batch, 3 * hidden_size] --> [seq_len, batch, num_attention_heads, 3 * hidden_size_per_attention_head]
+        new_tensor_shape = mixed_raw_layer.size()[:-1] + (
+            self.num_attention_heads_per_partition,
+            3 * self.hidden_size_per_attention_head,
+        )
+        mixed_raw_layer = mixed_raw_layer.view(*new_tensor_shape)
+
+        # [seq_len, batch, num_attention_heads, hidden_size_per_attention_head]
+        (query_layer, key_layer, value_layer) = self.split_tensor_along_last_dim(mixed_raw_layer, 3)
+
+        if self.position_encoding_2d:
+            q1, q2 = query_layer.chunk(2, dim=(query_layer.ndim - 1))
+            k1, k2 = key_layer.chunk(2, dim=(key_layer.ndim - 1))
+            cos, sin = self.rotary_emb(q1, seq_len=position_ids.max() + 1)
+            position_ids, block_position_ids = position_ids[:, 0, :].transpose(0, 1).contiguous(), \
+                                               position_ids[:, 1, :].transpose(0, 1).contiguous()
+            q1, k1 = apply_rotary_pos_emb_index(q1, k1, cos, sin, position_ids)
+            q2, k2 = apply_rotary_pos_emb_index(q2, k2, cos, sin, block_position_ids)
+            query_layer = torch.concat([q1, q2], dim=(q1.ndim - 1))
+            key_layer = torch.concat([k1, k2], dim=(k1.ndim - 1))
+        else:
+            position_ids = position_ids.transpose(0, 1)
+            cos, sin = self.rotary_emb(value_layer, seq_len=position_ids.max() + 1)
+            # [seq_len, batch, num_attention_heads, hidden_size_per_attention_head]
+            query_layer, key_layer = apply_rotary_pos_emb_index(query_layer, key_layer, cos, sin, position_ids)
+
+        # [seq_len, batch, hidden_size]
+        context_layer, present, attention_probs = attention_fn(
+            self=self, 
+            query_layer=query_layer, 
+            key_layer=key_layer, 
+            value_layer=value_layer, 
+            attention_mask=attention_mask, 
+            hidden_size_per_partition=self.hidden_size_per_partition, 
+            layer_id=layer_id, 
+            layer_past=layer_past, 
+            use_cache=use_cache
+        )
+
+        output = self.dense(context_layer)
+
+        outputs = (output, present)
+
+        if output_attentions:
+            outputs += (attention_probs,)
+
+        return outputs # output, present, attention_probs
+
+
+class GEGLU(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.activation_fn = F.gelu
+
+    def forward(self, x):
+        # dim=-1 breaks in jit for pt<1.10
+        x1, x2 = x.chunk(2, dim=(x.ndim - 1))
+        return x1 * self.activation_fn(x2)
+
+
+class GLU(torch.nn.Module):
+    def __init__(self, hidden_size, inner_hidden_size=None,
+        layer_id=None, bias=True, activation_func=gelu, params_dtype=torch.float):
+        super(GLU, self).__init__()
+        self.layer_id = layer_id
+        self.activation_func = activation_func
+
+        # Project to 4h.
+        self.hidden_size = hidden_size
+        if inner_hidden_size is None:
+            inner_hidden_size = 4 * hidden_size
+        self.inner_hidden_size = inner_hidden_size
+        self.dense_h_to_4h = skip_init(
+            torch.nn.Linear,
+            self.hidden_size,
+            self.inner_hidden_size,
+            bias=bias,
+            dtype=params_dtype,
+        )
+        # Project back to h.
+        self.dense_4h_to_h = skip_init(
+            torch.nn.Linear,
+            self.inner_hidden_size,
+            self.hidden_size,
+            bias=bias,
+            dtype=params_dtype,
+        )
+        
 
     def forward(self, hidden_states):
-        hidden_states = self.dense(hidden_states)
-        hidden_states = self.transform_act_fn(hidden_states)
-        hidden_states = self.LayerNorm(hidden_states)
-        return hidden_states
+        """
+        hidden_states: [seq_len, batch, hidden_size]
+        """
+        
+        # [seq_len, batch, inner_hidden_size]
+        intermediate_parallel = self.dense_h_to_4h(hidden_states)
+
+        intermediate_parallel = self.activation_func(intermediate_parallel)
+
+        output = self.dense_4h_to_h(intermediate_parallel)
+
+        return output
 
 
-class ChatGLM6BLMPredictionHead(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.transform = ChatGLM6BPredictionHeadTransform(config)
+class GLM6BBlock(torch.nn.Module):
+    def __init__(
+        self,
+        hidden_size,
+        num_attention_heads,
+        layernorm_epsilon,
+        layer_id,
+        inner_hidden_size=None,
+        hidden_size_per_attention_head=None,
+        layernorm=LayerNorm,
+        use_bias=True,
+        params_dtype=torch.float,
+        num_layers=28,
+        position_encoding_2d=True
+    ):
+        super(GLM6BBlock, self).__init__()
+        # Set output layer initialization if not provided.
 
-        # The output weights are the same as the input embeddings, but there is
-        # an output-only bias for each token.
-        self.decoder = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.layer_id = layer_id
 
-        self.bias = nn.Parameter(torch.zeros(config.vocab_size))
+        # Layernorm on the input data.
+        self.input_layernorm = layernorm(hidden_size, eps=layernorm_epsilon)
+        
+        self.position_encoding_2d = position_encoding_2d
 
-        # Need a link between the two variables so that the bias is correctly resized with `resize_token_embeddings`
-        self.decoder.bias = self.bias
+        # Self attention.
+        self.attention = SelfAttention(
+            hidden_size,
+            num_attention_heads,
+            layer_id,
+            hidden_size_per_attention_head=hidden_size_per_attention_head,
+            bias=use_bias,
+            params_dtype=params_dtype,
+            position_encoding_2d=self.position_encoding_2d
+        )
 
-    def forward(self, hidden_states):
-        hidden_states = self.transform(hidden_states)
-        hidden_states = self.decoder(hidden_states)
-        return hidden_states
+        # Layernorm on the input data.
+        self.post_attention_layernorm = layernorm(hidden_size, eps=layernorm_epsilon)
 
+        self.num_layers = num_layers
 
-class ChatGLM6BOnlyMLMHead(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.predictions = ChatGLM6BLMPredictionHead(config)
+        # GLU
+        self.mlp = GLU(
+            hidden_size,
+            inner_hidden_size=inner_hidden_size,
+            bias=use_bias,
+            layer_id=layer_id,
+            params_dtype=params_dtype,
+        )
 
-    def forward(self, sequence_output):
-        prediction_scores = self.predictions(sequence_output)
-        return prediction_scores
+    def forward(
+        self, 
+        hidden_states: torch.Tensor,
+        position_ids,
+        attention_mask: torch.Tensor,
+        layer_id,
+        layer_past: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        use_cache: bool = False,
+        output_attentions: bool = False,
+    ):
+        """
+        hidden_states: [seq_len, batch, hidden_size]
+        attention_mask: [(1, 1), seq_len, seq_len]
+        """
+
+        # Layer norm at the begining of the transformer layer.
+        # [seq_len, batch, hidden_size]
+        attention_input = self.input_layernorm(hidden_states)
+        
+        # Self attention.
+        attention_outputs = self.attention(
+            attention_input, 
+            position_ids, 
+            attention_mask=attention_mask, 
+            layer_id=layer_id, 
+            layer_past=layer_past, 
+            use_cache=use_cache, 
+            output_attentions=output_attentions
+        )
+
+        attention_output = attention_outputs[0]
+
+        outputs = attention_outputs[1:]
+
+        # Residual connection.
+        alpha = (2 * self.num_layers) ** 0.5
+        hidden_states = attention_input * alpha + attention_output
+
+        mlp_input = self.post_attention_layernorm(hidden_states)
+
+        # MLP.
+        mlp_output = self.mlp(mlp_input)
+
+        # Second residual connection.
+        output = mlp_input * alpha + mlp_output
+
+        if use_cache:
+            outputs = (output,) + outputs
+        else:
+            outputs = (output,) + outputs[1:]
+
+        return outputs # hidden_states, present, attentions
 
 
 class ChatGLM6BPreTrainedModel(PreTrainedModel):
@@ -658,31 +632,18 @@ class ChatGLM6BPreTrainedModel(PreTrainedModel):
     a simple interface for downloading and loading pretrained models.
     """
 
+    is_parallelizable = True
+    supports_gradient_checkpointing = False
     config_class = ChatGLM6BConfig
-    load_tf_weights = load_tf_weights_in_chatglm_6b
-    base_model_prefix = "chatglm_6b"
-    supports_gradient_checkpointing = True
-    _keys_to_ignore_on_load_missing = [r"position_ids"]
+    base_model_prefix = "transformer"
+    _no_split_modules = ["GLM6BBlock"]
 
-    def _init_weights(self, module):
-        """ Initialize the weights """
-        if isinstance(module, nn.Linear):
-            # Slightly different from the TF version which uses truncated_normal for initialization
-            # cf https://github.com/pytorch/pytorch/pull/5617
-            module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
-            if module.bias is not None:
-                module.bias.data.zero_()
-        elif isinstance(module, nn.Embedding):
-            module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
-            if module.padding_idx is not None:
-                module.weight.data[module.padding_idx].zero_()
-        elif isinstance(module, nn.LayerNorm):
-            module.bias.data.zero_()
-            module.weight.data.fill_(1.0)
+    def __init__(self, *inputs, **kwargs):
+        super().__init__(*inputs, **kwargs)
 
-    def _set_gradient_checkpointing(self, module, value=False):
-        if isinstance(module, ChatGLM6BEncoder):
-            module.gradient_checkpointing = value
+    def _init_weights(self, module: nn.Module):
+        """Initialize the weights."""
+        return
 
 
 CHATGLM_6B_START_DOCSTRING = r"""
@@ -766,29 +727,87 @@ class ChatGLM6BModel(ChatGLM6BPreTrainedModel):
     `encoder_hidden_states` is then expected as an input to the forward pass.
     """
 
-    def __init__(self, config):
+    def __init__(self, config: ChatGLM6BConfig):
         super().__init__(config)
-        self.config = config
 
-        self.embeddings = ChatGLM6BEmbeddings(config)
-        self.encoder = ChatGLM6BEncoder(config)
+        # recording parameters
+        self.max_sequence_length = config.max_sequence_length
+        self.hidden_size = config.hidden_size
+        self.params_dtype = torch.half
+        self.num_attention_heads = config.num_attention_heads
+        self.vocab_size = config.vocab_size
+        self.num_layers = config.num_layers
+        self.layernorm_epsilon = config.layernorm_epsilon
+        self.inner_hidden_size = config.inner_hidden_size
+        self.hidden_size_per_attention_head = self.hidden_size // self.num_attention_heads
+        self.position_encoding_2d = config.position_encoding_2d
 
-        # Initialize weights and apply final processing
-        self.post_init()
+        self.word_embeddings = skip_init(
+            torch.nn.Embedding,
+            num_embeddings=self.vocab_size, embedding_dim=self.hidden_size, 
+            dtype=self.params_dtype
+        )
+            
+        def get_layer(layer_id):
+            return GLM6BBlock(
+                self.hidden_size,
+                self.num_attention_heads,
+                self.layernorm_epsilon,
+                layer_id,
+                inner_hidden_size=self.inner_hidden_size,
+                hidden_size_per_attention_head=self.hidden_size_per_attention_head,
+                layernorm=LayerNorm,
+                use_bias=True,
+                params_dtype=self.params_dtype,
+                position_encoding_2d=self.position_encoding_2d,
+            )
+
+        self.layers = torch.nn.ModuleList(
+            [get_layer(layer_id) for layer_id in range(self.num_layers)]
+        )
+
+        # Final layer norm before output.
+        self.final_layernorm = LayerNorm(self.hidden_size, eps=self.layernorm_epsilon)
 
     def get_input_embeddings(self):
-        return self.embeddings.word_embeddings
+        return self.word_embeddings
 
-    def set_input_embeddings(self, value):
-        self.embeddings.word_embeddings = value
+    def set_input_embeddings(self, new_embeddings: torch.Tensor):
+        self.word_embeddings = new_embeddings
 
-    def _prune_heads(self, heads_to_prune):
-        """Prunes heads of the model.
-        heads_to_prune: dict of {layer_num: list of heads to prune in this layer}
-        See base class PreTrainedModel
-        """
-        for layer, heads in heads_to_prune.items():
-            self.encoder.layer[layer].attention.prune_heads(heads)
+    @staticmethod
+    def get_masks(seq, device):
+        context_length = seq.index(150004) + 1
+
+        attention_mask = torch.ones((1, len(seq), len(seq)), device=device)
+        attention_mask.tril_()
+        attention_mask[..., :context_length - 1] = 1
+        attention_mask.unsqueeze_(1)
+        attention_mask = (attention_mask < 0.5).bool()
+
+        return attention_mask
+
+    @staticmethod
+    def get_position_ids(seq, mask_position, device, gmask=False):
+        context_length = seq.index(150004) + 1
+        if self.position_encoding_2d:
+            seq_length = seq.index(150004)
+            position_ids = torch.arange(context_length, dtype=torch.long, device=device)
+            if not gmask:
+                position_ids[seq_length:] = mask_position
+            block_position_ids = torch.cat((
+                torch.zeros(seq_length, dtype=torch.long, device=device),
+                torch.arange(context_length - seq_length, dtype=torch.long, device=device) + 1
+            ))
+            position_ids = torch.stack((position_ids, block_position_ids), dim=0)
+        else:
+            position_ids = torch.arange(context_length, dtype=torch.long, device=device)
+            if not gmask:
+                position_ids[context_length - 1:] = mask_position
+
+        position_ids = position_ids.unsqueeze(0)
+
+        return position_ids
 
     @add_start_docstrings_to_model_forward(CHATGLM_6B_INPUTS_DOCSTRING.format("batch_size, sequence_length"))
     @add_code_sample_docstrings(
@@ -798,763 +817,367 @@ class ChatGLM6BModel(ChatGLM6BPreTrainedModel):
     )
     def forward(
         self,
-        input_ids=None,
-        attention_mask=None,
-        token_type_ids=None,
-        position_ids=None,
-        head_mask=None,
-        inputs_embeds=None,
-        encoder_hidden_states=None,
-        encoder_attention_mask=None,
-        past_key_values=None,
-        use_cache=None,
-        output_attentions=None,
-        output_hidden_states=None,
-        return_dict=None,
-    ):
-        r"""
-        encoder_hidden_states  (`torch.FloatTensor` of shape `(batch_size, sequence_length, hidden_size)`, *optional*):
-            Sequence of hidden-states at the output of the last layer of the encoder. Used in the cross-attention
-            if the model is configured as a decoder.
-        encoder_attention_mask (`torch.FloatTensor` of shape `(batch_size, sequence_length)`, *optional*):
-            Mask to avoid performing attention on the padding token indices of the encoder input. This mask
-            is used in the cross-attention if the model is configured as a decoder.
-            Mask values selected in `[0, 1]`:
+        input_ids: Optional[torch.LongTensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        past_key_values: Optional[Tuple[Tuple[torch.Tensor, torch.Tensor], ...]] = None,
+        inputs_embeds: Optional[torch.LongTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+    ) -> Union[Tuple[torch.Tensor, ...], BaseModelOutputWithPast]:
 
-            - 1 for tokens that are **not masked**,
-            - 0 for tokens that are **masked**.
-        past_key_values (`tuple(tuple(torch.FloatTensor))` of length `config.n_layers` with each tuple having 4 tensors of shape `(batch_size, num_heads, sequence_length - 1, embed_size_per_head)`):
-            Contains precomputed key and value hidden states of the attention blocks. Can be used to speed up decoding.
-            If `past_key_values` are used, the user can optionally input only the last `decoder_input_ids`
-            (those that don't have their past key value states given to this model) of shape `(batch_size, 1)`
-            instead of all `decoder_input_ids` of shape `(batch_size, sequence_length)`.
-        use_cache (`bool`, *optional*):
-            If set to `True`, `past_key_values` key value states are returned and can be used to speed up
-            decoding (see `past_key_values`).
-        """
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
+        use_cache = use_cache if use_cache is not None else self.config.use_cache
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-
-        if self.config.is_decoder:
-            use_cache = use_cache if use_cache is not None else self.config.use_cache
-        else:
-            use_cache = False
 
         if input_ids is not None and inputs_embeds is not None:
             raise ValueError("You cannot specify both input_ids and inputs_embeds at the same time")
         elif input_ids is not None:
-            input_shape = input_ids.size()
+            batch_size, seq_length = input_ids.shape[:2]
         elif inputs_embeds is not None:
-            input_shape = inputs_embeds.size()[:-1]
+            batch_size, seq_length, _ = inputs_embeds.shape[:2]
         else:
             raise ValueError("You have to specify either input_ids or inputs_embeds")
 
-        batch_size, seq_length = input_shape
-        device = input_ids.device if input_ids is not None else inputs_embeds.device
+        if past_key_values is None:
+            past_key_values = tuple([None] * len(self.layers))
 
-        # past_key_values_length
-        past_key_values_length = past_key_values[0][0].shape[2] if past_key_values is not None else 0
+            MASK, gMASK = 150000, 150001
+            mask_token = MASK if MASK in input_ids else gMASK
+            use_gmask = False if MASK in input_ids else gMASK
+            seq = input_ids[0].tolist()
+            
+            mask_position = seq.index(mask_token)
 
+            if attention_mask is None:
+                attention_mask = self.get_masks(
+                    seq=seq,
+                    device=input_ids.device
+                )
 
+            if position_ids is None:
+                position_ids = self.get_position_ids(
+                    seq=seq,
+                    mask_position=mask_position,
+                    device=input_ids.device,
+                    gmask=use_gmask
+                )
+
+        if inputs_embeds is None:
+            inputs_embeds = self.word_embeddings(input_ids)
+
+        # [seq_len, batch, hidden_size]
+        hidden_states = inputs_embeds.transpose(0, 1)
+
+        presents = () if use_cache else None
+        all_self_attentions = () if output_attentions else None
+        all_hidden_states = () if output_hidden_states else None
+
+        seq_length_with_past = seq_length
+        past_key_values_length = 0
+        if past_key_values[0] is not None:
+            past_key_values_length = past_key_values[0][0].shape[0]
+            seq_length_with_past = seq_length_with_past + past_key_values_length
         if attention_mask is None:
-            attention_mask = torch.ones(((batch_size, seq_length + past_key_values_length)), device=device)
-
-        if token_type_ids is None:
-            if hasattr(self.embeddings, "token_type_ids"):
-                buffered_token_type_ids = self.embeddings.token_type_ids[:, :seq_length]
-                buffered_token_type_ids_expanded = buffered_token_type_ids.expand(batch_size, seq_length)
-                token_type_ids = buffered_token_type_ids_expanded
-            else:
-                token_type_ids = torch.zeros(input_shape, dtype=torch.long, device=device)
-
-        # We can provide a self-attention mask of dimensions [batch_size, from_seq_length, to_seq_length]
-        # ourselves in which case we just need to make it broadcastable to all heads.
-        extended_attention_mask: torch.Tensor = self.get_extended_attention_mask(attention_mask, input_shape)
-
-        # If a 2D or 3D attention mask is provided for the cross-attention
-        # we need to make broadcastable to [batch_size, num_heads, seq_length, seq_length]
-        if self.config.is_decoder and encoder_hidden_states is not None:
-            encoder_batch_size, encoder_sequence_length, _ = encoder_hidden_states.size()
-            encoder_hidden_shape = (encoder_batch_size, encoder_sequence_length)
-            if encoder_attention_mask is None:
-                encoder_attention_mask = torch.ones(encoder_hidden_shape, device=device)
-            encoder_extended_attention_mask = self.invert_attention_mask(encoder_attention_mask)
+            attention_mask = torch.zeros(1, 1, device=input_ids.device).bool()
+            
         else:
-            encoder_extended_attention_mask = None
+            attention_mask = attention_mask.to(input_ids.device)
 
-        # Prepare head mask if needed
-        # 1.0 in head_mask indicate we keep the head
-        # attention_probs has shape bsz x n_heads x N x N
-        # input head_mask has shape [num_heads] or [num_hidden_layers x num_heads]
-        # and head_mask is converted to shape [num_hidden_layers x batch x num_heads x seq_length x seq_length]
-        head_mask = self.get_head_mask(head_mask, self.config.num_hidden_layers)
+        for i, layer in enumerate(self.layers):
 
-        embedding_output = self.embeddings(
-            input_ids=input_ids,
-            position_ids=position_ids,
-            token_type_ids=token_type_ids,
-            inputs_embeds=inputs_embeds,
-            past_key_values_length=past_key_values_length,
-        )
-        encoder_outputs = self.encoder(
-            embedding_output,
-            attention_mask=extended_attention_mask,
-            head_mask=head_mask,
-            encoder_hidden_states=encoder_hidden_states,
-            encoder_attention_mask=encoder_extended_attention_mask,
-            past_key_values=past_key_values,
-            use_cache=use_cache,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
-        )
-        sequence_output = encoder_outputs[0]
+            if output_hidden_states:
+                all_hidden_states = all_hidden_states + (hidden_states,)
 
-        if not return_dict:
-            return (sequence_output,) + encoder_outputs[1:]
-
-        return BaseModelOutputWithPastAndCrossAttentions(
-            last_hidden_state=sequence_output,
-            past_key_values=encoder_outputs.past_key_values,
-            hidden_states=encoder_outputs.hidden_states,
-            attentions=encoder_outputs.attentions,
-            cross_attentions=encoder_outputs.cross_attentions,
-        )
-
-
-@add_start_docstrings("""ChatGLM-6B Model with a `language modeling` head on top. """, CHATGLM_6B_START_DOCSTRING)
-class ChatGLM6BForMaskedLM(ChatGLM6BPreTrainedModel):
-    def __init__(self, config):
-        super().__init__(config)
-
-        if config.is_decoder:
-            logger.warning(
-                "If you want to use `ChatGLM6BForMaskedLM` make sure `config.is_decoder=False` for "
-                "bi-directional self-attention."
+            layer_ret = layer(
+                hidden_states,
+                position_ids=position_ids,
+                attention_mask=attention_mask,
+                layer_id=torch.tensor(i),
+                layer_past=past_key_values[i],
+                use_cache=use_cache,
+                output_attentions=output_attentions
             )
 
-        self.chatglm_6b = ChatGLM6BModel(config)
-        self.cls = ChatGLM6BOnlyMLMHead(config)
+            hidden_states = layer_ret[0]
 
-        # Initialize weights and apply final processing
-        self.post_init()
+            if use_cache:
+                presents = presents + (layer_ret[1],)
 
-    def get_output_embeddings(self):
-        return self.cls.predictions.decoder
+            if output_attentions:
+                all_self_attentions = all_self_attentions + (layer_ret[2 if use_cache else 1],)
 
-    def set_output_embeddings(self, new_embeddings):
-        self.cls.predictions.decoder = new_embeddings
+        # Final layer norm.
+        hidden_states = self.final_layernorm(hidden_states)
 
-    @add_start_docstrings_to_model_forward(CHATGLM_6B_INPUTS_DOCSTRING.format("batch_size, sequence_length"))
-    @add_code_sample_docstrings(
-        checkpoint=_CHECKPOINT_FOR_DOC,
-        output_type=MaskedLMOutput,
-        config_class=_CONFIG_FOR_DOC,
-    )
-    def forward(
-        self,
-        input_ids=None,
-        attention_mask=None,
-        token_type_ids=None,
-        position_ids=None,
-        head_mask=None,
-        inputs_embeds=None,
-        encoder_hidden_states=None,
-        encoder_attention_mask=None,
-        labels=None,
-        output_attentions=None,
-        output_hidden_states=None,
-        return_dict=None,
-    ):
-        r"""
-        labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
-            Labels for computing the masked language modeling loss.
-            Indices should be in `[-100, 0, ..., config.vocab_size]` (see `input_ids` docstring)
-            Tokens with indices set to `-100` are ignored (masked), the loss is only computed for the tokens with labels
-            in `[0, ..., config.vocab_size]`.
-        """
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-
-        outputs = self.chatglm_6b(
-            input_ids,
-            attention_mask=attention_mask,
-            token_type_ids=token_type_ids,
-            position_ids=position_ids,
-            head_mask=head_mask,
-            inputs_embeds=inputs_embeds,
-            encoder_hidden_states=encoder_hidden_states,
-            encoder_attention_mask=encoder_attention_mask,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
-        )
-
-        sequence_output = outputs[0]
-        prediction_scores = self.cls(sequence_output)
-
-        masked_lm_loss = None
-        if labels is not None:
-            loss_fct = CrossEntropyLoss()  # -100 index = padding token
-            masked_lm_loss = loss_fct(prediction_scores.view(-1, self.config.vocab_size), labels.view(-1))
+        if output_hidden_states:
+            all_hidden_states = all_hidden_states + (hidden_states,)
 
         if not return_dict:
-            output = (prediction_scores,) + outputs[1:]
-            return ((masked_lm_loss,) + output) if masked_lm_loss is not None else output
+            return tuple(v for v in [hidden_states, presents, all_hidden_states, all_self_attentions] if v is not None)
 
-        return MaskedLMOutput(
-            loss=masked_lm_loss,
-            logits=prediction_scores,
-            hidden_states=outputs.hidden_states,
-            attentions=outputs.attentions,
+        return BaseModelOutputWithPast(
+            last_hidden_state=hidden_states,
+            past_key_values=presents,
+            hidden_states=all_hidden_states,
+            attentions=all_self_attentions,
         )
 
-    def prepare_inputs_for_generation(self, input_ids, attention_mask=None, **model_kwargs):
-        input_shape = input_ids.shape
-        effective_batch_size = input_shape[0]
 
-        #  add a dummy token
-        assert self.config.pad_token_id is not None, "The PAD token should be defined for generation"
-        attention_mask = torch.cat([attention_mask, attention_mask.new_zeros((attention_mask.shape[0], 1))], dim=-1)
-        dummy_token = torch.full(
-            (effective_batch_size, 1), self.config.pad_token_id, dtype=torch.long, device=input_ids.device
-        )
-        input_ids = torch.cat([input_ids, dummy_token], dim=1)
-
-        return {"input_ids": input_ids, "attention_mask": attention_mask}
-
-
-@add_start_docstrings(
-    """ChatGLM-6B Model with a `language modeling` head on top for CLM fine-tuning. """, CHATGLM_6B_START_DOCSTRING
-)
-class ChatGLM6BForCausalLM(ChatGLM6BPreTrainedModel):
-
-    _keys_to_ignore_on_load_missing = [r"position_ids", r"predictions.decoder.bias"]
-
+class ChatGLM6BForConditionalGeneration(ChatGLM6BPreTrainedModel):
     def __init__(self, config):
         super().__init__(config)
 
-        if not config.is_decoder:
-            logger.warning("If you want to use `ChatGLM6BForCausalLM` as a standalone, add `is_decoder=True.`")
+        # self.hidden_size = config.hidden_size
+        # self.params_dtype = torch.half
+        # self.vocab_size = config.vocab_size
+        self.max_sequence_length = config.max_sequence_length
 
-        self.chatglm_6b = ChatGLM6BModel(config)
-        self.cls = ChatGLM6BOnlyMLMHead(config)
+        self.position_encoding_2d = config.position_encoding_2d
 
-        # Initialize weights and apply final processing
-        self.post_init()
+        self.transformer = ChatGLM6BModel(config)
+
+        self.lm_head = skip_init(
+            nn.Linear,
+            config.hidden_size, 
+            config.vocab_size, 
+            bias=False,
+            dtype=torch.half
+        )
 
     def get_output_embeddings(self):
-        return self.cls.predictions.decoder
+        return self.lm_head
 
     def set_output_embeddings(self, new_embeddings):
-        self.cls.predictions.decoder = new_embeddings
+        self.lm_head = new_embeddings
 
-    @add_start_docstrings_to_model_forward(CHATGLM_6B_INPUTS_DOCSTRING.format("batch_size, sequence_length"))
-    @replace_return_docstrings(output_type=CausalLMOutputWithCrossAttentions, config_class=_CONFIG_FOR_DOC)
+    def get_masks_and_position_ids(self, seq, mask_position, context_length, device, gmask=False):
+        attention_mask = torch.ones((1, context_length, context_length), device=device)
+        attention_mask.tril_()
+        attention_mask[..., :context_length - 1] = 1
+        attention_mask.unsqueeze_(1)
+        attention_mask = (attention_mask < 0.5).bool()
+
+        if self.position_encoding_2d:
+            seq_length = seq.index(150004)
+            position_ids = torch.arange(context_length, dtype=torch.long, device=device)
+            if not gmask:
+                position_ids[seq_length:] = mask_position
+            block_position_ids = torch.cat((
+                torch.zeros(seq_length, dtype=torch.long, device=device),
+                torch.arange(context_length - seq_length, dtype=torch.long, device=device) + 1
+            ))
+            position_ids = torch.stack((position_ids, block_position_ids), dim=0)
+        else:
+            position_ids = torch.arange(context_length, dtype=torch.long, device=device)
+            if not gmask:
+                position_ids[context_length - 1:] = mask_position
+
+        position_ids = position_ids.unsqueeze(0)
+
+        return attention_mask, position_ids
+
+    def prepare_inputs_for_generation(
+        self, 
+        input_ids: torch.LongTensor,
+        past: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        **kwargs
+    ) -> dict:
+
+        MASK, gMASK = 150000, 150001
+        mask_token = MASK if MASK in input_ids else gMASK
+        use_gmask = False if MASK in input_ids else gMASK
+        seq = input_ids[0].tolist()
+        mask_position = seq.index(mask_token)
+
+        if mask_token not in seq:
+            raise ValueError("You have to add either [MASK] or [gMASK] in your input")
+
+        # only last token for input_ids if past is not None
+        if past:
+            context_length = seq.index(150004)
+            last_token = input_ids[:, -1].unsqueeze(-1)
+            if self.position_encoding_2d:
+                position_ids = torch.tensor([[[mask_position], [len(seq) - context_length]]], dtype=torch.long, device=input_ids.device)
+            else:
+                position_ids = torch.tensor([[mask_position]], dtype=torch.long, device=input_ids.device)
+
+            return {
+                "input_ids": last_token,
+                "past_key_values": past,
+                "position_ids": position_ids,
+            }
+        else:
+            attention_mask, position_ids = self.get_masks_and_position_ids(
+                seq=seq,
+                mask_position=mask_position,
+                context_length=len(seq),
+                device=input_ids.device,
+                gmask=use_gmask
+            )
+
+            return {
+                "input_ids": input_ids,
+                "past_key_values": past,
+                "position_ids": position_ids, 
+                "attention_mask": attention_mask
+            }
+
+    
     def forward(
-            self,
-            input_ids=None,
-            attention_mask=None,
-            token_type_ids=None,
-            position_ids=None,
-            inputs_embeds=None,
-            encoder_hidden_states=None,
-            encoder_attention_mask=None,
-            head_mask=None,
-            cross_attn_head_mask=None,
-            past_key_values=None,
-            labels=None,
-            use_cache=None,
-            output_attentions=None,
-            output_hidden_states=None,
-            return_dict=None,
+        self,
+        input_ids: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        past_key_values: Optional[Tuple[torch.FloatTensor]] = None,
+        inputs_embeds: Optional[torch.Tensor] = None,
+        labels: Optional[torch.Tensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
     ):
-        r"""
-        encoder_hidden_states  (`torch.FloatTensor` of shape `(batch_size, sequence_length, hidden_size)`, *optional*):
-            Sequence of hidden-states at the output of the last layer of the encoder. Used in the cross-attention if
-            the model is configured as a decoder.
-        encoder_attention_mask (`torch.FloatTensor` of shape `(batch_size, sequence_length)`, *optional*):
-            Mask to avoid performing attention on the padding token indices of the encoder input. This mask is used in
-            the cross-attention if the model is configured as a decoder. Mask values selected in `[0, 1]`:
-
-            - 1 for tokens that are **not masked**,
-            - 0 for tokens that are **masked**.
-        past_key_values (`tuple(tuple(torch.FloatTensor))`, *optional*, returned when `use_cache=True` is passed or when `config.use_cache=True`):
-            Tuple of `tuple(torch.FloatTensor)` of length `config.n_layers`, with each tuple having 2
-            tensors of shape `(batch_size, num_heads, sequence_length, embed_size_per_head)`) and 2 additional
-            tensors of shape `(batch_size, num_heads, encoder_sequence_length, embed_size_per_head)`. The two
-            additional tensors are only required when the model is used as a decoder in a Sequence to Sequence
-            model.
-
-            Contains pre-computed hidden-states (key and values in the self-attention blocks and in the
-            cross-attention blocks) that can be used (see `past_key_values` input) to speed up sequential
-            decoding.
-
-            If `past_key_values` are used, the user can optionally input only the last `decoder_input_ids`
-            (those that don't have their past key value states given to this model) of shape `(batch_size, 1)`
-            instead of all `decoder_input_ids` of shape `(batch_size, sequence_length)`.
-        labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
-            Labels for computing the left-to-right language modeling loss (next word prediction). Indices should be in
-            `[-100, 0, ..., config.vocab_size]` (see `input_ids` docstring) Tokens with indices set to `-100` are
-            ignored (masked), the loss is only computed for the tokens with labels n `[0, ..., config.vocab_size]`.
-        use_cache (`bool`, *optional*):
-            If set to `True`, `past_key_values` key value states are returned and can be used to speed up
-            decoding (see `past_key_values`).
-
-        Returns:
-
-        Example:
-
-        ```python
-        >>> from transformers import ChatGLM6BTokenizer, ChatGLM6BForCausalLM, ChatGLM6BConfig
-        >>> import torch
-
-        >>> tokenizer = ChatGLM6BTokenizer.from_pretrained('THUDM/ChatGLM-6B')
-        >>> config = ChatGLM6BConfig.from_pretrained("THUDM/ChatGLM-6B")
-        >>> config.is_decoder = True
-        >>> model = ChatGLM6BForCausalLM.from_pretrained('THUDM/ChatGLM-6B', config=config)
-
-        >>> inputs = tokenizer("Hello, my dog is cute", return_tensors="pt")
-        >>> outputs = model(**inputs)
-
-        >>> prediction_logits = outputs.logits
-        ```
-"""
+        use_cache = use_cache if use_cache is not None else self.config.use_cache
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        outputs = self.chatglm_6b(
-            input_ids,
-            attention_mask=attention_mask,
-            token_type_ids=token_type_ids,
+        transformer_outputs = self.transformer(
+            input_ids=input_ids,
             position_ids=position_ids,
-            head_mask=head_mask,
-            inputs_embeds=inputs_embeds,
-            encoder_hidden_states=encoder_hidden_states,
-            encoder_attention_mask=encoder_attention_mask,
+            attention_mask=attention_mask,
             past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
             use_cache=use_cache,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
         )
+        
+        hidden_states = transformer_outputs[0]
 
-        sequence_output = outputs[0]
-        prediction_scores = self.cls(sequence_output)
-
-        lm_loss = None
-        if labels is not None:
-            # we are doing next-token prediction; shift prediction scores and input ids by one
-            shifted_prediction_scores = prediction_scores[:, :-1, :].contiguous()
-            labels = labels[:, 1:].contiguous()
-            loss_fct = CrossEntropyLoss()
-            lm_loss = loss_fct(shifted_prediction_scores.view(-1, self.config.vocab_size), labels.view(-1))
-
-        if not return_dict:
-            output = (prediction_scores,) + outputs[1:]
-            return ((lm_loss,) + output) if lm_loss is not None else output
-
-        return CausalLMOutputWithCrossAttentions(
-            loss=lm_loss,
-            logits=prediction_scores,
-            past_key_values=outputs.past_key_values,
-            hidden_states=outputs.hidden_states,
-            attentions=outputs.attentions,
-            cross_attentions=outputs.cross_attentions,
-        )
-
-    def prepare_inputs_for_generation(self, input_ids, past_key_values=None, attention_mask=None, **model_kwargs):
-        input_shape = input_ids.shape
-
-        # if model is used as a decoder in encoder-decoder model, the decoder attention mask is created on the fly
-        if attention_mask is None:
-            attention_mask = input_ids.new_ones(input_shape)
-
-        # cut decoder_input_ids if past is used
-        if past_key_values is not None:
-            input_ids = input_ids[:, -1:]
-
-        return {"input_ids": input_ids, "attention_mask": attention_mask, "past_key_values": past_key_values}
-
-    def _reorder_cache(self, past_key_values, beam_idx):
-        reordered_past = ()
-        for layer_past in past_key_values:
-            reordered_past += (tuple(past_state.index_select(0, beam_idx) for past_state in layer_past[:2]) + layer_past[2:],)
-        return reordered_past
-
-class ChatGLM6BClassificationHead(nn.Module):
-    """Head for sentence-level classification tasks."""
-
-    def __init__(self, config):
-        super().__init__()
-        self.dense = nn.Linear(config.hidden_size, config.hidden_size)
-        self.dropout = nn.Dropout(config.hidden_dropout_prob)
-        self.out_proj = nn.Linear(config.hidden_size, config.num_labels)
-
-        self.config = config
-
-    def forward(self, features, **kwargs):
-        x = features[:, 0, :]  # take <s> token (equiv. to [CLS])
-        x = self.dropout(x)
-        x = self.dense(x)
-        x = ACT2FN[self.config.hidden_act](x)
-        x = self.dropout(x)
-        x = self.out_proj(x)
-        return x
-
-
-@add_start_docstrings(
-    """ChatGLM-6B Model transformer with a sequence classification/regression head on top (a linear layer on top of
-    the pooled output) e.g. for GLUE tasks. """,
-    CHATGLM_6B_START_DOCSTRING,
-)
-class ChatGLM6BForSequenceClassification(ChatGLM6BPreTrainedModel):
-    def __init__(self, config):
-        super().__init__(config)
-        self.num_labels = config.num_labels
-        self.chatglm_6b = ChatGLM6BModel(config)
-        self.classifier = ChatGLM6BClassificationHead(config)
-
-        # Initialize weights and apply final processing
-        self.post_init()
-
-    @add_start_docstrings_to_model_forward(CHATGLM_6B_INPUTS_DOCSTRING.format("batch_size, sequence_length"))
-    @add_code_sample_docstrings(
-        checkpoint=_CHECKPOINT_FOR_DOC,
-        output_type=SequenceClassifierOutput,
-        config_class=_CONFIG_FOR_DOC,
-    )
-    def forward(
-            self,
-            input_ids=None,
-            attention_mask=None,
-            token_type_ids=None,
-            position_ids=None,
-            head_mask=None,
-            inputs_embeds=None,
-            labels=None,
-            output_attentions=None,
-            output_hidden_states=None,
-            return_dict=None,
-    ):
-        r"""
-        labels (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
-            Labels for computing the sequence classification/regression loss.
-            Indices should be in `[0, ..., config.num_labels - 1]`.
-            If `config.num_labels == 1` a regression loss is computed (Mean-Square loss),
-            If `config.num_labels > 1` a classification loss is computed (Cross-Entropy).
-        """
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-
-        outputs = self.chatglm_6b(
-            input_ids,
-            attention_mask=attention_mask,
-            token_type_ids=token_type_ids,
-            position_ids=position_ids,
-            head_mask=head_mask,
-            inputs_embeds=inputs_embeds,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
-        )
-
-        sequence_output = outputs[0]
-        logits = self.classifier(sequence_output)
+        lm_logits = self.lm_head(hidden_states).permute(1, 0, 2).contiguous()
 
         loss = None
         if labels is not None:
-            if self.config.problem_type is None:
-                if self.num_labels == 1:
-                    self.config.problem_type = "regression"
-                elif self.num_labels > 1 and (labels.dtype == torch.long or labels.dtype == torch.int):
-                    self.config.problem_type = "single_label_classification"
-                else:
-                    self.config.problem_type = "multi_label_classification"
+            lm_logits = lm_logits.to(torch.float32)
 
-            if self.config.problem_type == "regression":
-                loss_fct = MSELoss()
-                if self.num_labels == 1:
-                    loss = loss_fct(logits.squeeze(), labels.squeeze())
-                else:
-                    loss = loss_fct(logits, labels)
-            elif self.config.problem_type == "single_label_classification":
-                loss_fct = CrossEntropyLoss()
-                loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
-            elif self.config.problem_type == "multi_label_classification":
-                loss_fct = BCEWithLogitsLoss()
-                loss = loss_fct(logits, labels)
-        if not return_dict:
-            output = (logits,) + outputs[1:]
-            return ((loss,) + output) if loss is not None else output
-
-        return SequenceClassifierOutput(
-            loss=loss,
-            logits=logits,
-            hidden_states=outputs.hidden_states,
-            attentions=outputs.attentions,
-        )
-
-@add_start_docstrings(
-    """ChatGLM-6B Model with a multiple choice classification head on top (a linear layer on top of
-    the pooled output and a softmax) e.g. for RocStories/SWAG tasks. """,
-    CHATGLM_6B_START_DOCSTRING,
-)
-class ChatGLM6BForMultipleChoice(ChatGLM6BPreTrainedModel):
-    def __init__(self, config):
-        super().__init__(config)
-
-        self.chatglm_6b = ChatGLM6BModel(config)
-        self.sequence_summary = SequenceSummary(config)
-        self.classifier = nn.Linear(config.hidden_size, 1)
-
-        # Initialize weights and apply final processing
-        self.post_init()
-
-    @add_start_docstrings_to_model_forward(CHATGLM_6B_INPUTS_DOCSTRING.format("batch_size, num_choices, sequence_length"))
-    @add_code_sample_docstrings(
-        checkpoint=_CHECKPOINT_FOR_DOC,
-        output_type=MultipleChoiceModelOutput,
-        config_class=_CONFIG_FOR_DOC,
-    )
-    def forward(
-            self,
-            input_ids=None,
-            attention_mask=None,
-            token_type_ids=None,
-            position_ids=None,
-            head_mask=None,
-            inputs_embeds=None,
-            labels=None,
-            output_attentions=None,
-            output_hidden_states=None,
-            return_dict=None,
-    ):
-        r"""
-        labels (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
-            Labels for computing the multiple choice classification loss.
-            Indices should be in `[0, ..., num_choices-1]` where `num_choices` is the size of the second dimension
-            of the input tensors. (See `input_ids` above)
-        """
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-        num_choices = input_ids.shape[1] if input_ids is not None else inputs_embeds.shape[1]
-
-        input_ids = input_ids.view(-1, input_ids.size(-1)) if input_ids is not None else None
-        attention_mask = attention_mask.view(-1, attention_mask.size(-1)) if attention_mask is not None else None
-        token_type_ids = token_type_ids.view(-1, token_type_ids.size(-1)) if token_type_ids is not None else None
-        position_ids = position_ids.view(-1, position_ids.size(-1)) if position_ids is not None else None
-        inputs_embeds = (
-            inputs_embeds.view(-1, inputs_embeds.size(-2), inputs_embeds.size(-1))
-            if inputs_embeds is not None
-            else None
-        )
-
-        outputs = self.chatglm_6b(
-            input_ids,
-            attention_mask=attention_mask,
-            token_type_ids=token_type_ids,
-            position_ids=position_ids,
-            head_mask=head_mask,
-            inputs_embeds=inputs_embeds,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
-        )
-
-        sequence_output = outputs[0]
-
-        pooled_output = self.sequence_summary(sequence_output)
-        logits = self.classifier(pooled_output)
-        reshaped_logits = logits.view(-1, num_choices)
-
-        loss = None
-        if labels is not None:
+            # Shift so that tokens < n predict n
+            shift_logits = lm_logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            # Flatten the tokens
             loss_fct = CrossEntropyLoss()
-            loss = loss_fct(reshaped_logits, labels)
+            loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+
+            lm_logits = lm_logits.to(hidden_states.dtype)
+            loss = loss.to(hidden_states.dtype)
 
         if not return_dict:
-            output = (reshaped_logits,) + outputs[1:]
+            output = (lm_logits,) + transformer_outputs[1:]
             return ((loss,) + output) if loss is not None else output
 
-        return MultipleChoiceModelOutput(
+        return CausalLMOutputWithPast(
             loss=loss,
-            logits=reshaped_logits,
-            hidden_states=outputs.hidden_states,
-            attentions=outputs.attentions,
+            logits=lm_logits,
+            past_key_values=transformer_outputs.past_key_values,
+            hidden_states=transformer_outputs.hidden_states,
+            attentions=transformer_outputs.attentions,
         )
 
+    @staticmethod
+    def _reorder_cache(
+        past: Tuple[Tuple[torch.Tensor, torch.Tensor], ...], beam_idx: torch.LongTensor
+    ) -> Tuple[Tuple[torch.Tensor, torch.Tensor], ...]:
+        """
+        This function is used to re-order the `past_key_values` cache if [`~PreTrainedModel.beam_search`] or
+        [`~PreTrainedModel.beam_sample`] is called. This is required to match `past_key_values` with the correct
+        beam_idx at every generation step.
 
-@add_start_docstrings(
-    """ChatGLM-6B Model with a token classification head on top (a linear layer on top of
-    the hidden-states output) e.g. for Named-Entity-Recognition (NER) tasks. """,
-    CHATGLM_6B_START_DOCSTRING,
-)
-class ChatGLM6BForTokenClassification(ChatGLM6BPreTrainedModel):
-    def __init__(self, config):
-        super().__init__(config)
-        self.num_labels = config.num_labels
+        Output shares the same memory storage as `past`.
+        """
+        return tuple(
+            (
+                layer_past[0].index_select(1, beam_idx.to(layer_past[0].device)),
+                layer_past[1].index_select(1, beam_idx.to(layer_past[1].device)),
+            )
+            for layer_past in past
+        )
 
-        self.chatglm_6b = ChatGLM6BModel(config)
-        self.dropout = nn.Dropout(config.hidden_dropout_prob)
-        self.classifier = nn.Linear(config.hidden_size, config.num_labels)
+    @torch.no_grad()
+    def chat(self, tokenizer, query: str, history: List[Tuple[str, str]] = [], max_length: int = 2048):
+        if not history:
+            prompt = query
+            input_ids = tokenizer([prompt + "[gMASK]"], return_tensors="pt", padding=True)
+            input_ids = input_ids.to('cuda')
+            outputs = self.generate(**input_ids, max_length=max_length, num_beams=2)
+            outputs = outputs.tolist()[0][len(input_ids["input_ids"][0]) - 2 : ]
+            response = tokenizer.decode(outputs)
+            history.append((query, response))
+        else:
+            prompt = ""
+            new_query = query
+            for i, (query, response) in enumerate(history):
+                prompt += "## 第 {} 轮##\n问：{}\n答：{}\n".format(i, query, response)
+            prompt += "## 第 {} 轮##\n问：{}\n答：[gMASK]".format(len(history), new_query)
+            input_ids = tokenizer([prompt], return_tensors="pt", padding=True)
+            input_ids = input_ids.to('cuda')
+            outputs = self.generate(**input_ids, max_length=max_length, num_beams=2)
+            outputs = outputs.tolist()[0][len(input_ids["input_ids"][0]) - 2: ]
+            response = tokenizer.decode(outputs)
+            history.append((new_query, response))
+        return response, history
 
-        # Initialize weights and apply final processing
-        self.post_init()
-
-    @add_start_docstrings_to_model_forward(CHATGLM_6B_INPUTS_DOCSTRING.format("batch_size, sequence_length"))
-    @add_code_sample_docstrings(
-        checkpoint=_CHECKPOINT_FOR_DOC,
-        output_type=TokenClassifierOutput,
-        config_class=_CONFIG_FOR_DOC,
-    )
-    def forward(
+    @torch.no_grad()
+    def generate(
         self,
-        input_ids=None,
-        attention_mask=None,
-        token_type_ids=None,
-        position_ids=None,
-        head_mask=None,
-        inputs_embeds=None,
-        labels=None,
-        output_attentions=None,
-        output_hidden_states=None,
-        return_dict=None,
+        **kwargs,
     ):
-        r"""
-        labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
-            Labels for computing the token classification loss.
-            Indices should be in `[0, ..., config.num_labels - 1]`.
-        """
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        MASK, gMASK = 150000, 150001
+        bos, eos = 150004, 150005
 
-        outputs = self.chatglm_6b(
-            input_ids,
-            attention_mask=attention_mask,
-            token_type_ids=token_type_ids,
-            position_ids=position_ids,
-            head_mask=head_mask,
-            inputs_embeds=inputs_embeds,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
-        )
+        if "eos_token_id" not in kwargs:
+            kwargs["eos_token_id"] = eos
 
-        sequence_output = outputs[0]
+        stop = False
 
-        sequence_output = self.dropout(sequence_output)
-        logits = self.classifier(sequence_output)
+        return_seqs = []
 
-        loss = None
-        if labels is not None:
-            loss_fct = CrossEntropyLoss()
-            loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
+        while True:            
+            output_ids = super().generate(**kwargs)
 
-        if not return_dict:
-            output = (logits,) + outputs[1:]
-            return ((loss,) + output) if loss is not None else output
+            return_seqs = []
+            max_length = 0
 
-        return TokenClassifierOutput(
-            loss=loss,
-            logits=logits,
-            hidden_states=outputs.hidden_states,
-            attentions=outputs.attentions,
-        )
+            for i in range(output_ids.shape[0]):
+                output_seq = output_ids[i].tolist()
+                mask_token = MASK if MASK in output_seq else gMASK
+                mask_position = output_seq.index(mask_token)
+                bos_position = output_seq.index(bos)
+                if eos in output_seq:
+                    eos_position = output_seq.index(eos)
+                else:
+                    eos_position = len(output_seq)
+                    
+                return_seq = output_seq[:mask_position] + output_seq[bos_position+1:eos_position] + output_seq[mask_position+1:bos_position]
+                max_length = max(max_length, len(return_seq))
+                return_seqs.append(return_seq)
 
+            for i in range(output_ids.shape[0]):
+                return_seqs[i] = [0] * (max_length - len(return_seqs[i])) + return_seqs[i]  # padding
+                if mask_token not in return_seqs[i]: 
+                    stop = True
 
-@add_start_docstrings(
-    """ChatGLM-6B Model with a span classification head on top for extractive question-answering tasks like SQuAD (a linear
-    layers on top of the hidden-states output to compute `span start logits` and `span end logits`). """,
-    CHATGLM_6B_START_DOCSTRING,
-)
-class ChatGLM6BForQuestionAnswering(ChatGLM6BPreTrainedModel):
-    def __init__(self, config):
-        super().__init__(config)
+            if stop:
+                break
+            
+            for return_seq in return_seqs:
+                return_seq += [bos]
+            
+            kwargs['input_ids'] = torch.tensor(return_seqs, dtype=torch.long, device=kwargs['input_ids'].device)
+            
+        return torch.tensor(return_seqs, dtype=torch.long, device=kwargs['input_ids'].device)
 
-        config.num_labels = 2
-        self.num_labels = config.num_labels
-
-        self.chatglm_6b = ChatGLM6BModel(config)
-        self.qa_outputs = nn.Linear(config.hidden_size, config.num_labels)
-
-        # Initialize weights and apply final processing
-        self.post_init()
-
-    @add_start_docstrings_to_model_forward(CHATGLM_6B_INPUTS_DOCSTRING.format("batch_size, sequence_length"))
-    @add_code_sample_docstrings(
-        checkpoint=_CHECKPOINT_FOR_DOC,
-        output_type=QuestionAnsweringModelOutput,
-        config_class=_CONFIG_FOR_DOC,
-    )
-    def forward(
-        self,
-        input_ids=None,
-        attention_mask=None,
-        token_type_ids=None,
-        position_ids=None,
-        head_mask=None,
-        inputs_embeds=None,
-        start_positions=None,
-        end_positions=None,
-        output_attentions=None,
-        output_hidden_states=None,
-        return_dict=None,
-    ):
-        r"""
-        start_positions (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
-            Labels for position (index) of the start of the labelled span for computing the token classification loss.
-            Positions are clamped to the length of the sequence (`sequence_length`).
-            Position outside of the sequence are not taken into account for computing the loss.
-        end_positions (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
-            Labels for position (index) of the end of the labelled span for computing the token classification loss.
-            Positions are clamped to the length of the sequence (`sequence_length`).
-            Position outside of the sequence are not taken into account for computing the loss.
-        """
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-
-        outputs = self.chatglm_6b(
-            input_ids,
-            attention_mask=attention_mask,
-            token_type_ids=token_type_ids,
-            position_ids=position_ids,
-            head_mask=head_mask,
-            inputs_embeds=inputs_embeds,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
-        )
-
-        sequence_output = outputs[0]
-
-        logits = self.qa_outputs(sequence_output)
-        start_logits, end_logits = logits.split(1, dim=-1)
-        start_logits = start_logits.squeeze(-1)
-        end_logits = end_logits.squeeze(-1)
-
-        total_loss = None
-        if start_positions is not None and end_positions is not None:
-            # If we are on multi-GPU, split add a dimension
-            if len(start_positions.size()) > 1:
-                start_positions = start_positions.squeeze(-1)
-            if len(end_positions.size()) > 1:
-                end_positions = end_positions.squeeze(-1)
-            # sometimes the start/end positions are outside our model inputs, we ignore these terms
-            ignored_index = start_logits.size(1)
-            start_positions = start_positions.clamp(0, ignored_index)
-            end_positions = end_positions.clamp(0, ignored_index)
-
-            loss_fct = CrossEntropyLoss(ignore_index=ignored_index)
-            start_loss = loss_fct(start_logits, start_positions)
-            end_loss = loss_fct(end_logits, end_positions)
-            total_loss = (start_loss + end_loss) / 2
-
-        if not return_dict:
-            output = (start_logits, end_logits) + outputs[1:]
-            return ((total_loss,) + output) if total_loss is not None else output
-
-        return QuestionAnsweringModelOutput(
-            loss=total_loss,
-            start_logits=start_logits,
-            end_logits=end_logits,
-            hidden_states=outputs.hidden_states,
-            attentions=outputs.attentions,
-        )

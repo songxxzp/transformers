@@ -937,15 +937,9 @@ else:
     _import_structure["models.chatglm_6b"].extend(
         [
             "CHATGLM_6B_PRETRAINED_MODEL_ARCHIVE_LIST",
-            "ChatGLM6BForMaskedLM",
-            "ChatGLM6BForCausalLM",
-            "ChatGLM6BForMultipleChoice",
-            "ChatGLM6BForQuestionAnswering",
-            "ChatGLM6BForSequenceClassification",
-            "ChatGLM6BForTokenClassification",
-            "ChatGLM6BLayer",
             "ChatGLM6BModel",
             "ChatGLM6BPreTrainedModel",
+            "ChatGLM6BForConditionalGeneration",
             "load_tf_weights_in_chatglm_6b",
         ]
     )
