@@ -122,6 +122,7 @@ _import_structure = {
     ],
     "models": [],
     # Models
+    "models.chatglm_6b": ["CHATGLM_6B_PRETRAINED_CONFIG_ARCHIVE_MAP", "ChatGLM6BConfig", "ChatGLM6BTokenizer"],
     "models.albert": ["ALBERT_PRETRAINED_CONFIG_ARCHIVE_MAP", "AlbertConfig"],
     "models.align": [
         "ALIGN_PRETRAINED_CONFIG_ARCHIVE_MAP",
@@ -696,6 +697,7 @@ except OptionalDependencyNotAvailable:
     ]
 else:
     # Fast tokenizers structure
+    _import_structure["models.chatglm_6b"].append("ChatGLM6BTokenizerFast")
     _import_structure["models.albert"].append("AlbertTokenizerFast")
     _import_structure["models.bart"].append("BartTokenizerFast")
     _import_structure["models.barthez"].append("BarthezTokenizerFast")
@@ -931,6 +933,22 @@ else:
     _import_structure["modeling_utils"] = ["PreTrainedModel"]
 
     # PyTorch models structure
+
+    _import_structure["models.chatglm_6b"].extend(
+        [
+            "CHATGLM_6B_PRETRAINED_MODEL_ARCHIVE_LIST",
+            "ChatGLM6BForMaskedLM",
+            "ChatGLM6BForCausalLM",
+            "ChatGLM6BForMultipleChoice",
+            "ChatGLM6BForQuestionAnswering",
+            "ChatGLM6BForSequenceClassification",
+            "ChatGLM6BForTokenClassification",
+            "ChatGLM6BLayer",
+            "ChatGLM6BModel",
+            "ChatGLM6BPreTrainedModel",
+            "load_tf_weights_in_chatglm_6b",
+        ]
+    )
     _import_structure["models.albert"].extend(
         [
             "ALBERT_PRETRAINED_MODEL_ARCHIVE_LIST",
@@ -3726,6 +3744,7 @@ if TYPE_CHECKING:
         load_tf2_weights_in_pytorch_model,
     )
     from .models.albert import ALBERT_PRETRAINED_CONFIG_ARCHIVE_MAP, AlbertConfig
+    from .models.chatglm_6b import CHATGLM_6B_PRETRAINED_CONFIG_ARCHIVE_MAP, ChatGLM6BConfig, ChatGLM6BTokenizer
     from .models.align import (
         ALIGN_PRETRAINED_CONFIG_ARCHIVE_MAP,
         AlignConfig,
@@ -4257,6 +4276,7 @@ if TYPE_CHECKING:
         from .utils.dummy_tokenizers_objects import *
     else:
         # Fast tokenizers imports
+        from .models.chatglm_6b import ChatGLM6BTokenizerFast
         from .models.albert import AlbertTokenizerFast
         from .models.bart import BartTokenizerFast
         from .models.barthez import BarthezTokenizerFast
@@ -4453,6 +4473,20 @@ if TYPE_CHECKING:
         from .modeling_utils import PreTrainedModel
 
         # PyTorch model imports
+
+        from .models.chatglm_6b import (
+            CHATGLM_6B_PRETRAINED_MODEL_ARCHIVE_LIST,
+            ChatGLM6BForMaskedLM,
+            ChatGLM6BForCausalLM,
+            ChatGLM6BForMultipleChoice,
+            ChatGLM6BForQuestionAnswering,
+            ChatGLM6BForSequenceClassification,
+            ChatGLM6BForTokenClassification,
+            ChatGLM6BLayer,
+            ChatGLM6BModel,
+            ChatGLM6BPreTrainedModel,
+            load_tf_weights_in_chatglm_6b,
+        )
         from .models.albert import (
             ALBERT_PRETRAINED_MODEL_ARCHIVE_LIST,
             AlbertForMaskedLM,

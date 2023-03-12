@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from . import (
+    chatglm_6b,
     albert,
     align,
     altclip,
